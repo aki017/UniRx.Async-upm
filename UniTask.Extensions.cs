@@ -13,18 +13,10 @@ namespace UniRx.Async
         /// <summary>
         /// Convert UniTask -> UniTask[AsyncUnit].
         /// </summary>
-        public static async UniTask<AsyncUnit> AsAsyncUnitUniTask(this UniTask task)
+        public static UniTask<AsyncUnit> AsAsyncUnitUniTask(this UniTask task)
         {
-            await task;
-            return AsyncUnit.Default;
-        }
-
-        /// <summary>
-        /// Convert UniTask[T] -> UniTask.
-        /// </summary>
-        public static async UniTask AsUniTask<T>(this UniTask<T> task)
-        {
-            await task;
+            // use implicit conversion
+            return task;
         }
 
         /// <summary>
@@ -32,22 +24,22 @@ namespace UniRx.Async
         /// </summary>
         public static UniTask<T> AsUniTask<T>(this Task<T> task)
         {
-            var promise = new Promise<T>();
+            var promise = new UniTaskCompletionSource<T>();
 
             task.ContinueWith((x, state) =>
             {
-                var p = (Promise<T>)state;
+                var p = (UniTaskCompletionSource<T>)state;
 
                 switch (x.Status)
                 {
                     case TaskStatus.Canceled:
-                        p.SetCancel();
+                        p.TrySetCanceled();
                         break;
                     case TaskStatus.Faulted:
-                        p.SetException(x.Exception);
+                        p.TrySetException(x.Exception);
                         break;
                     case TaskStatus.RanToCompletion:
-                        p.SetResult(x.Result);
+                        p.TrySetResult(x.Result);
                         break;
                     default:
                         throw new NotSupportedException();
@@ -62,22 +54,22 @@ namespace UniRx.Async
         /// </summary>
         public static UniTask AsUniTask(this Task task)
         {
-            var promise = new Promise<AsyncUnit>();
+            var promise = new UniTaskCompletionSource<AsyncUnit>();
 
             task.ContinueWith((x, state) =>
             {
-                var p = (Promise<AsyncUnit>)state;
+                var p = (UniTaskCompletionSource<AsyncUnit>)state;
 
                 switch (x.Status)
                 {
                     case TaskStatus.Canceled:
-                        p.SetCancel();
+                        p.TrySetCanceled();
                         break;
                     case TaskStatus.Faulted:
-                        p.SetException(x.Exception);
+                        p.TrySetException(x.Exception);
                         break;
                     case TaskStatus.RanToCompletion:
-                        p.SetResult(default(AsyncUnit));
+                        p.TrySetResult(default(AsyncUnit));
                         break;
                     default:
                         throw new NotSupportedException();
@@ -97,23 +89,179 @@ namespace UniRx.Async
             return new ToCoroutineEnumerator(task, exceptionHandler);
         }
 
-        public static async UniTask<T> Timeout<T>(this UniTask<T> task, TimeSpan timeout, CancellationTokenSource cancellationTokenSource = null)
+        public static UniTask Timeout(this UniTask task, TimeSpan timeout, CancellationTokenSource taskCancellationTokenSource = null)
         {
-            if (cancellationTokenSource == null)
-            {
-                cancellationTokenSource = new CancellationTokenSource();
-            }
+            return Timeout(task.AsAsyncUnitUniTask(), timeout, taskCancellationTokenSource);
+        }
 
-            var timeoutTask = UniTask.Delay(timeout, cancellationToken: cancellationTokenSource.Token);
+        public static async UniTask<T> Timeout<T>(this UniTask<T> task, TimeSpan timeout, CancellationTokenSource taskCancellationTokenSource = null)
+        {
+            var delayCancellationTokenSource = new CancellationTokenSource();
+            var timeoutTask = UniTask.Delay(timeout, cancellationToken: delayCancellationTokenSource.Token);
 
             var (hasValue, value) = await UniTask.WhenAny(task, timeoutTask);
             if (!hasValue)
             {
+                if (taskCancellationTokenSource != null)
+                {
+                    taskCancellationTokenSource.Cancel();
+                }
+
                 throw new TimeoutException();
             }
+            else
+            {
+                delayCancellationTokenSource.Cancel();
+            }
 
-            cancellationTokenSource.Cancel();
             return value;
+        }
+
+        public static UniTask WithCancellation(this UniTask task, CancellationToken cancellationToken, CancellationTokenSource taskCancellationTokenSource = null)
+        {
+            return WithCancellation(task.AsAsyncUnitUniTask(), cancellationToken, taskCancellationTokenSource);
+        }
+
+        public static async UniTask<T> WithCancellation<T>(this UniTask<T> task, CancellationToken cancellationToken, CancellationTokenSource taskCancellationTokenSource = null)
+        {
+            var (cancellationTask, registration) = cancellationToken.ToUniTask();
+
+            var (hasValue, value) = await UniTask.WhenAny(task, cancellationTask);
+            if (!hasValue)
+            {
+                if (taskCancellationTokenSource != null)
+                {
+                    taskCancellationTokenSource.Cancel();
+                }
+
+                throw new OperationCanceledException(cancellationToken);
+            }
+            else
+            {
+                registration.Dispose();
+            }
+
+            return value;
+        }
+
+        public static void Forget(this UniTask task, Action<Exception> exceptionHandler = null)
+        {
+            ForgetCore(task, exceptionHandler).Forget();
+        }
+
+        static async UniTaskVoid ForgetCore(UniTask task, Action<Exception> exceptionHandler)
+        {
+            try
+            {
+                await task;
+            }
+            catch (Exception ex)
+            {
+                if (exceptionHandler != null)
+                {
+                    exceptionHandler(ex);
+                    return;
+                }
+                else
+                {
+                    throw;
+                }
+            }
+        }
+
+        public static void Forget<T>(this UniTask<T> task, Action<Exception> exceptionHandler = null)
+        {
+            ForgetCore(task, exceptionHandler).Forget();
+        }
+
+        static async UniTaskVoid ForgetCore<T>(UniTask<T> task, Action<Exception> exceptionHandler)
+        {
+            try
+            {
+                await task;
+            }
+            catch (Exception ex)
+            {
+                if (exceptionHandler != null)
+                {
+                    exceptionHandler(ex);
+                    return;
+                }
+                else
+                {
+                    throw;
+                }
+            }
+        }
+
+        public static async UniTask ContinueWith<T>(this UniTask<T> task, Action<T> continuationFunction)
+        {
+            continuationFunction(await task);
+        }
+
+        public static async UniTask ContinueWith<T>(this UniTask<T> task, Func<T, UniTask> continuationFunction)
+        {
+            await continuationFunction(await task);
+        }
+
+        public static async UniTask<TR> ContinueWith<T, TR>(this UniTask<T> task, Func<T, TR> continuationFunction)
+        {
+            return continuationFunction(await task);
+        }
+
+        public static async UniTask<TR> ContinueWith<T, TR>(this UniTask<T> task, Func<T, UniTask<TR>> continuationFunction)
+        {
+            return await continuationFunction(await task);
+        }
+
+        public static async UniTask ContinueWith(this UniTask task, Action continuationFunction)
+        {
+            await task;
+            continuationFunction();
+        }
+
+        public static async UniTask ContinueWith(this UniTask task, Func<UniTask> continuationFunction)
+        {
+            await task;
+            await continuationFunction();
+        }
+
+        public static async UniTask<T> ContinueWith<T>(this UniTask task, Func<T> continuationFunction)
+        {
+            await task;
+            return continuationFunction();
+        }
+
+        public static async UniTask<T> ContinueWith<T>(this UniTask task, Func<UniTask<T>> continuationFunction)
+        {
+            await task;
+            return await continuationFunction();
+        }
+
+        public static async UniTask ConfigureAwait(this Task task, PlayerLoopTiming timing)
+        {
+            await task.ConfigureAwait(false);
+            await UniTask.Yield(timing);
+        }
+
+        public static async UniTask<T> ConfigureAwait<T>(this Task<T> task, PlayerLoopTiming timing)
+        {
+            var v = await task.ConfigureAwait(false);
+            await UniTask.Yield(timing);
+            return v;
+        }
+
+        public static async UniTask ConfigureAwait(this UniTask task, PlayerLoopTiming timing)
+        {
+            await task;
+            await UniTask.Yield(timing);
+        }
+
+        public static async UniTask<T> ConfigureAwait<T>(this UniTask<T> task, PlayerLoopTiming timing)
+        {
+            var v = await task;
+            await UniTask.Yield(timing);
+            return v;
         }
 
         class ToCoroutineEnumerator : IEnumerator
@@ -157,7 +305,7 @@ namespace UniRx.Async
 
             public bool MoveNext()
             {
-                if (isStarted)
+                if (!isStarted)
                 {
                     isStarted = true;
                     RunTask(task).Forget();
